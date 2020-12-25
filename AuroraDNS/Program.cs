@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.Caching;
 using System.Threading;
 using System.Threading.Tasks;
 using ARSoft.Tools.Net;
@@ -17,7 +18,6 @@ using static System.Net.ServicePointManager;
 
 namespace AuroraDNS
 {
-
     static class Program
     {
         private static IPAddress IntIPAddr;
@@ -29,7 +29,6 @@ namespace AuroraDNS
 
         public static class ADnsSetting
         {
-
             public static string HttpsDnsUrl = "https://1.0.0.1/dns-query";
             //"https://dns.google.com/resolve";
             //"https://dnsp.mili.one:23233/dns-query";
@@ -41,73 +40,78 @@ namespace AuroraDNS
             public static bool EDnsCustomize;
             public static bool ProxyEnable;
             public static bool IPv6Enable = true;
-            public static bool DebugLog;
+            public static float TlsVersion = 0;
+            public static bool DebugLog = true;
             public static bool BlackListEnable;
-            public static bool ChinaListEnable;
+            public static bool ChinaListEnable = true;
             public static bool WhiteListEnable;
+            public static bool DnsCacheEnable = true;
             public static bool AllowSelfSignedCert;
             public static WebProxy WProxy = new WebProxy("127.0.0.1:1080");
         }
 
         static void Main(string[] args)
         {
+            if (File.Exists("config.json"))
+                ReadConfig("config.json");
+
+            Thread.Sleep(1500);
+            Console.Clear();
             Console.WriteLine(Resource.ASCII);
 
             OriginColor = Console.ForegroundColor;
             LocIPAddr = IPAddress.Parse(GetLocIp());
 
-            SecurityProtocol = SecurityProtocolType.Tls12;
-            if (ADnsSetting.AllowSelfSignedCert)
+            switch (ADnsSetting.TlsVersion)
             {
+                case 1:
+                    SecurityProtocol = SecurityProtocolType.Tls;
+                    break;
+                case 1.1F:
+                    SecurityProtocol = SecurityProtocolType.Tls11;
+                    break;
+                case 1.2F:
+                    SecurityProtocol = SecurityProtocolType.Tls12;
+                    break;
+                default:
+                    SecurityProtocol = SecurityProtocolType.Tls12;
+                    break;
+            }
+
+            if (ADnsSetting.AllowSelfSignedCert)
                 ServerCertificateValidationCallback +=
                     (sender, cert, chain, sslPolicyErrors) => true;
-            }
 
             if (Thread.CurrentThread.CurrentCulture.Name == "zh-CN")
-            {
                 IntIPAddr = IPAddress.Parse(new WebClient().DownloadString("http://members.3322.org/dyndns/getip").Trim());
-            }
             else
-            {
                 IntIPAddr = IPAddress.Parse(new WebClient().DownloadString("https://api.ipify.org").Trim());
-            }
 
-            Console.Clear();
-
-            if (!string.IsNullOrWhiteSpace(string.Join("",args)))
-                ReadConfig(args[0]);
-            if (File.Exists("config.json"))
-                ReadConfig("config.json");
+            //Console.Clear();
 
             if (ADnsSetting.BlackListEnable)
             {
                 string[] blackListStrs = File.ReadAllLines("black.list");
-
                 BlackList = Array.ConvertAll(blackListStrs, DomainName.Parse).ToList();
 
                 if (ADnsSetting.DebugLog)
                 {
                     Console.WriteLine(@"-------Black List-------");
                     foreach (var itemName in BlackList)
-                    {
                         Console.WriteLine(itemName.ToString());
-                    }
                 }
             }
 
             if (ADnsSetting.ChinaListEnable)
             {
                 string[] chinaListStrs = File.ReadAllLines("china.list");
-
                 ChinaList = Array.ConvertAll(chinaListStrs, DomainName.Parse).ToList();
 
                 if (ADnsSetting.DebugLog)
                 {
                     Console.WriteLine(@"-------China List-------");
                     foreach (var itemName in ChinaList)
-                    {
                         Console.WriteLine(itemName.ToString());
-                    }
                 }
             }
 
@@ -128,9 +132,7 @@ namespace AuroraDNS
                 {
                     Console.WriteLine(@"-------White List-------");
                     foreach (var itemName in WhiteList)
-                    {
                         Console.WriteLine(itemName.Key + @" : " + itemName.Value);
-                    }
                 }
             }
 
@@ -159,19 +161,16 @@ namespace AuroraDNS
             IPAddress clientAddress = e.RemoteEndpoint.Address;
             if (ADnsSetting.EDnsCustomize)
                 if (Equals(ADnsSetting.EDnsIp, IPAddress.Parse("0.0.0.1")))
-                {
                     clientAddress = IPAddress.Parse(IntIPAddr.ToString().Substring(0,
-                                                        IntIPAddr.ToString().LastIndexOf(".", StringComparison.Ordinal)) + ".0");
-                }
+                                                        IntIPAddr.ToString()
+                                                            .LastIndexOf(".", StringComparison.Ordinal)) + ".0");
                 else
-                {
                     clientAddress = ADnsSetting.EDnsIp;
-                }
+
             else if (Equals(clientAddress, IPAddress.Loopback))
                 clientAddress = IntIPAddr;
             else if (InSameLaNet(clientAddress, LocIPAddr) && !Equals(IntIPAddr, LocIPAddr))
                 clientAddress = IntIPAddr;
-
             DnsMessage response = query.CreateResponseInstance();
 
             try
@@ -184,53 +183,54 @@ namespace AuroraDNS
                     {
                         response.ReturnCode = ReturnCode.NoError;
                         if (ADnsSetting.DebugLog)
-                        {
                             Console.WriteLine(
                                 $@"| {DateTime.Now} {clientAddress} : {dnsQuestion.Name} | {dnsQuestion.RecordType.ToString().ToUpper()}");
+
+                        if (ADnsSetting.DnsCacheEnable && MemoryCache.Default.Contains($"{dnsQuestion.Name}{dnsQuestion.RecordType}"))
+                        {
+                            response.AnswerRecords.AddRange(
+                                (List<DnsRecordBase>)MemoryCache.Default.Get($"{dnsQuestion.Name}{dnsQuestion.RecordType}"));
+                            response.AnswerRecords.Add(new TxtRecord(DomainName.Parse("cache.auroradns.mili.one"), 0,
+                                "AuroraDNSC Cached"));
+
+                            if (ADnsSetting.DebugLog)
+                                Console.WriteLine
+                                    ($@"|- CacheContains : {dnsQuestion.Name} | Count : {MemoryCache.Default.Count()}");
                         }
 
-                        if (ADnsSetting.BlackListEnable && BlackList.Contains(dnsQuestion.Name)
-                                                        && dnsQuestion.RecordType == RecordType.A)
+                        if (ADnsSetting.BlackListEnable && BlackList.Contains(dnsQuestion.Name) &&
+                            dnsQuestion.RecordType == RecordType.A)
                         {
                             if (ADnsSetting.DebugLog)
-                            {
                                 Console.WriteLine(@"|- BlackList");
-                            }
 
                             //BlackList
                             response.ReturnCode = ReturnCode.NxDomain;
-                            //response.AnswerRecords.Add(new ARecord(dnsQuestion.Name, 10, IPAddress.Any));
                         }
 
                         if (ADnsSetting.ChinaListEnable && dnsQuestion.RecordType == RecordType.A)
                         {
-                            if (ChinaList.Contains(dnsQuestion.Name) || dnsQuestion.Name.ToString().Contains(".cn") || dnsQuestion.Name.ToString().Contains(".xn--"))
+                            var domainSplit = dnsQuestion.Name.ToString().TrimEnd('.').Split('.');
+                            var nameStr = $"{domainSplit[domainSplit.Length - 2]}.{domainSplit[domainSplit.Length - 1]}";
+                            if (ChinaList.Contains(DomainName.Parse(nameStr)) || dnsQuestion.Name.ToString().Contains(".cn") ||
+                                dnsQuestion.Name.ToString().Contains(".xn--"))
                             {
                                 var resolvedDnsList = ResolveOverDNSPod(dnsQuestion.Name.ToString());
-
                                 if (resolvedDnsList != null && resolvedDnsList != new List<dynamic>())
-                                {
                                     foreach (var item in resolvedDnsList)
-                                    {
                                         response.AnswerRecords.Add(item);
-                                    }
-                                }
                                 else
-                                {
                                     response.ReturnCode = ReturnCode.NxDomain;
-                                }
 
-                                Console.WriteLine(@"|- ChinaList - DNSPOD");
+                                Console.WriteLine(@"|- ChinaList - DNSPOD D+");
                             }
                         }
 
-                        else if (ADnsSetting.WhiteListEnable && WhiteList.ContainsKey(dnsQuestion.Name)
-                                                             && dnsQuestion.RecordType == RecordType.A)
+                        else if (ADnsSetting.WhiteListEnable && WhiteList.ContainsKey(dnsQuestion.Name) &&
+                                 dnsQuestion.RecordType == RecordType.A)
                         {
                             if (ADnsSetting.DebugLog)
-                            {
                                 Console.WriteLine(@"|- WhiteList");
-                            }
 
                             //WhiteList
                             ARecord blackRecord = new ARecord(dnsQuestion.Name, 10, WhiteList[dnsQuestion.Name]);
@@ -244,17 +244,16 @@ namespace AuroraDNS
                                 dnsQuestion.Name.ToString(),
                                 ADnsSetting.ProxyEnable, ADnsSetting.WProxy, dnsQuestion.RecordType);
 
+                            var cacheItem = new CacheItem($"{dnsQuestion.Name}{dnsQuestion.RecordType}", resolvedDnsList);
+                            if (!MemoryCache.Default.Contains(cacheItem.Key))
+                                MemoryCache.Default.Add(cacheItem,
+                                    new CacheItemPolicy { AbsoluteExpiration = DateTimeOffset.Now + TimeSpan.FromSeconds(resolvedDnsList[0].TimeToLive) });
+
                             if (resolvedDnsList != null && resolvedDnsList != new List<dynamic>())
-                            {
                                 foreach (var item in resolvedDnsList)
-                                {
                                     response.AnswerRecords.Add(item);
-                                }
-                            }
                             else
-                            {
                                 response.ReturnCode = (ReturnCode) statusCode;
-                            }
                         }
                     }
                 }
@@ -268,7 +267,6 @@ namespace AuroraDNS
             }
 
             e.Response = response;
-
         }
 
         private static (List<dynamic> list, int statusCode) ResolveOverHttps(string clientIpAddress, string domainName,
@@ -279,6 +277,8 @@ namespace AuroraDNS
 
             using (WebClient webClient = new WebClient())
             {
+                webClient.Headers["User-Agent"] = "AuroraDNSC/0.1";
+
                 if (proxyEnable)
                     webClient.Proxy = wProxy;
 
@@ -320,9 +320,6 @@ namespace AuroraDNS
                                 DomainName.Parse(answerDomainName), ttl, DomainName.Parse(answerAddr));
 
                             recordList.Add(cRecord);
-
-                            //recordList.AddRange(ResolveOverHttps(clientIpAddress,answerAddr));
-                            //return recordList;
                         }
                     }
                     else if (type == RecordType.Aaaa && ADnsSetting.IPv6Enable)
@@ -355,7 +352,7 @@ namespace AuroraDNS
                     else if (type == RecordType.Mx && answerType == Convert.ToInt32(RecordType.Mx))
                     {
                         MxRecord mxRecord = new MxRecord(
-                            DomainName.Parse(answerDomainName), ttl, 
+                            DomainName.Parse(answerDomainName), ttl,
                             ushort.Parse(answerAddr.Split(' ')[0]),
                             DomainName.Parse(answerAddr.Split(' ')[1]));
                         recordList.Add(mxRecord);
@@ -379,21 +376,17 @@ namespace AuroraDNS
 
         public static List<dynamic> ResolveOverDNSPod(string domainName)
         {
-            List<dynamic> recordList = new List<dynamic>();
-
             string dnsStr = new WebClient().DownloadString(
-                $"http://119.29.29.29/d?dn={domainName}");
-            var dnsAnswerList = dnsStr.Split(';');
+                $"http://119.29.29.29/d?dn={domainName}&ttl=1");
+            if (string.IsNullOrWhiteSpace(dnsStr))
+                return null;
+            
+            var ttlTime = Convert.ToInt32(dnsStr.Split(',')[1]);
+            var dnsAnswerList = dnsStr.Split(',')[0].Split(';');
 
-            foreach (var item in dnsAnswerList)
-            {
-                ARecord aRecord = new ARecord(
-                    DomainName.Parse(domainName), 600, IPAddress.Parse(item));
-
-                recordList.Add(aRecord);
-            }
-
-            return recordList;
+            return dnsAnswerList
+                .Select(item => new ARecord(DomainName.Parse(domainName), ttlTime, IPAddress.Parse(item)))
+                .Cast<dynamic>().ToList();
         }
 
         private static bool InSameLaNet(IPAddress ipA, IPAddress ipB)
@@ -421,124 +414,60 @@ namespace AuroraDNS
         {
             Console.WriteLine(@"------Read Config-------");
 
-            JsonValue configJson = Json.Parse(File.ReadAllText(path));
-            try
-            {
-                ADnsSetting.ListenIp = IPAddress.Parse(configJson.AsObjectGetString("Listen"));
-            }
-            catch 
-            {
-                ADnsSetting.ListenIp = IPAddress.Any;
-            }
+            string jSrt = File.ReadAllText(path);
+            JsonValue configJson = Json.Parse(jSrt);
 
-            try
-            {
-                ADnsSetting.BlackListEnable = configJson.AsObjectGetBool("BlackList");
-            }
-            catch
-            {
-                ADnsSetting.BlackListEnable = false;
-            }
+            ADnsSetting.ListenIp = jSrt.Contains("Listen")
+                ? IPAddress.Parse(configJson.AsObjectGetString("Listen"))
+                : IPAddress.Any;
+            ADnsSetting.BlackListEnable =
+                jSrt.Contains("BlackList") && configJson.AsObjectGetBool("BlackList");
+            ADnsSetting.ChinaListEnable =
+                jSrt.Contains("ChinaList") && configJson.AsObjectGetBool("ChinaList");
+            ADnsSetting.WhiteListEnable =
+                jSrt.Contains("RewriteList") && configJson.AsObjectGetBool("RewriteList");
+            ADnsSetting.ProxyEnable =
+                jSrt.Contains("ProxyEnable") && configJson.AsObjectGetBool("ProxyEnable");
+            ADnsSetting.IPv6Enable =
+                !jSrt.Contains("IPv6Enable") || configJson.AsObjectGetBool("IPv6Enable");
+            ADnsSetting.AllowSelfSignedCert =
+                jSrt.Contains("AllowSelfSignedCert") && configJson.AsObjectGetBool("AllowSelfSignedCert");
+            ADnsSetting.TlsVersion =
+                jSrt.Contains("TlsVersion") ? configJson.AsObjectGetFloat("Listen") : 0;
+            ADnsSetting.EDnsCustomize =
+                jSrt.Contains("EDnsCustomize") && configJson.AsObjectGetBool("EDnsCustomize");
+            ADnsSetting.DebugLog =
+                jSrt.Contains("DebugLog") && configJson.AsObjectGetBool("DebugLog");
 
-            try
-            {
-                ADnsSetting.ChinaListEnable = configJson.AsObjectGetBool("ChinaList");
-            }
-            catch
-            {
-                ADnsSetting.ChinaListEnable = false;
-            }
+            ADnsSetting.EDnsIp = jSrt.Contains("EDnsClientIp")
+                ? IPAddress.Parse(configJson.AsObjectGetString("EDnsClientIp"))
+                : IPAddress.Any;
 
-            try
-            {
-                ADnsSetting.WhiteListEnable = configJson.AsObjectGetBool("RewriteList");
-            }
-            catch
-            {
-                ADnsSetting.WhiteListEnable = false;
-            }
-
-            try
-            {
-                ADnsSetting.ProxyEnable = configJson.AsObjectGetBool("ProxyEnable");
-            }
-            catch
-            {
-                ADnsSetting.ProxyEnable = false;
-            }
-
-            try
-            {
-                ADnsSetting.IPv6Enable = configJson.AsObjectGetBool("IPv6Enable");
-            }
-            catch
-            {
-                ADnsSetting.IPv6Enable = true;
-            }
-
-            try
-            {
-                ADnsSetting.AllowSelfSignedCert = configJson.AsObjectGetBool("AllowSelfSignedCert");
-            }
-            catch
-            {
-                ADnsSetting.AllowSelfSignedCert = false;
-            }
-
-            try
-            {
-                ADnsSetting.EDnsCustomize = configJson.AsObjectGetBool("EDnsCustomize");
-            }
-            catch
-            {
-                ADnsSetting.EDnsCustomize = false;
-            }
-
-            try
-            {
-                ADnsSetting.DebugLog = configJson.AsObjectGetBool("DebugLog");
-            }
-            catch
-            {
-                ADnsSetting.DebugLog = false;
-            }
-
-            try
-            {
-                ADnsSetting.EDnsIp = IPAddress.Parse(configJson.AsObjectGetString("EDnsClientIp"));
-            }
-            catch
-            {
-                ADnsSetting.EDnsIp = IPAddress.Any;
-            }
-
-            try
+            if (jSrt.Contains("HttpsDns"))
             {
                 ADnsSetting.HttpsDnsUrl = configJson.AsObjectGetString("HttpsDns");
                 if (string.IsNullOrEmpty(ADnsSetting.HttpsDnsUrl))
-                {
                     ADnsSetting.HttpsDnsUrl = "https://1.0.0.1/dns-query";
-                }
             }
-            catch
-            {
+            else
                 ADnsSetting.HttpsDnsUrl = "https://1.0.0.1/dns-query";
-            }
 
             Console.WriteLine(@"Listen        : " + ADnsSetting.ListenIp);
             Console.WriteLine(@"BlackList     : " + ADnsSetting.BlackListEnable);
             Console.WriteLine(@"RewriteList   : " + ADnsSetting.WhiteListEnable);
-            Console.WriteLine(@"ChinaList     : " + ADnsSetting.WhiteListEnable);
+            Console.WriteLine(@"ChinaList     : " + ADnsSetting.ChinaListEnable);
             Console.WriteLine(@"ProxyEnable   : " + ADnsSetting.ProxyEnable);
             Console.WriteLine(@"IPv6Enable    : " + ADnsSetting.IPv6Enable);
             Console.WriteLine(@"DebugLog      : " + ADnsSetting.DebugLog);
             Console.WriteLine(@"EDnsClient    : " + ADnsSetting.EDnsIp);
             Console.WriteLine(@"HttpsDns      : " + ADnsSetting.HttpsDnsUrl);
             Console.WriteLine(@"EDnsCustomize : " + ADnsSetting.EDnsCustomize);
+
             if (ADnsSetting.AllowSelfSignedCert)
-            {
                 Console.WriteLine(@"AllowSelfSignedCert : " + ADnsSetting.AllowSelfSignedCert);
-            }
+
+            if (ADnsSetting.TlsVersion != 0)
+                Console.WriteLine(@"TlsVersion : " + ADnsSetting.TlsVersion);
 
             if (ADnsSetting.ProxyEnable)
             {
